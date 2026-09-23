@@ -1,0 +1,67 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 0 * * *'      # 唯一建议按需修改：执行时间（cron 不支持变量）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 仅 fork 仓库运行：有 parent 即为 fork
+    if: github.event.repository.fork == true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}          # 自动：owner/repo
+          BRANCH: ${{ github.ref_name }}          # 自动：当前分支
+          # 自动定位当前 workflow 文件路径，无需手写
+          WORKFLOW_FILE: ${{ github.workflow_ref }}
+        run: |
+          set -e
+
+          # 1. 自动获取上游仓库（fork 的 parent）
+          UPSTREAM=$(gh api "repos/$REPO" --jq '.parent.full_name')
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "null" ]; then
+            echo "❌ 非 fork 仓库，跳过"; exit 0
+          fi
+          echo "上游: $UPSTREAM  分支: $BRANCH"
+
+          # 2. 配置 git
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 3. 添加上游 remote（用 token 认证，支持私有上游）
+          git remote add upstream "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git" \
+            || git remote set-url upstream "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git"
+
+          # 4. 备份当前 workflow 文件（自动取路径，去掉 owner/repo/ 前缀）
+          WF_PATH="${WORKFLOW_FILE#*/${REPO}/}"     # 得到 .github/workflows/xxx.yml
+          echo "当前 workflow 路径: $WF_PATH"
+          [ -f "$WF_PATH" ] && cp "$WF_PATH" /tmp/wf.bak
+
+          # 5. 拉取并合并上游
+          git fetch upstream "$BRANCH"
+          git merge "upstream/$BRANCH" --no-edit -X theirs || true
+
+          # 6. 恢复 workflow，确保同步后仍存在
+          if [ -f /tmp/wf.bak ]; then
+            cp /tmp/wf.bak "$WF_PATH"
+            git add "$WF_PATH"
+            git diff --cached --quiet || git commit -m "chore: keep sync workflow"
+          fi
+
+          # 7. 推送
+          git push origin "$BRANCH"
+          echo "✅ 同步完成"
